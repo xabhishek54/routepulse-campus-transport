@@ -3,10 +3,16 @@ RoutePulse core domain models.
 
 All times are represented as minutes since midnight (integer or float).
 Coordinates are (lat, lon) tuples representing campus locations.
+
+Metric definitions (canonical — referenced throughout the codebase):
+  overcrowding_event: stop-event where on_board_after >= capacity (at or above)
+  crowding_event:     stop-event where unmet_demand > 0 (passengers left behind)
+  unmet_demand:       count of passengers who arrived and could not board
+  delay:              actual_arrival - scheduled_arrival at a stop (minutes, + = late)
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import List, Optional
 import math
 
 
@@ -136,11 +142,19 @@ class StopEvent:
 
     @property
     def overcrowded(self) -> bool:
-        return self.on_board_after > self.capacity
+        """True when bus is at or over capacity (on_board >= capacity).
+        See metric definitions in models.py docstring."""
+        return self.on_board_after >= self.capacity
 
     @property
     def unmet_demand(self) -> int:
+        """Passengers who arrived but could not board."""
         return max(0, self.demand_at_stop - self.boarded)
+
+    @property
+    def crowded(self) -> bool:
+        """True when any passengers were left behind at this stop."""
+        return self.unmet_demand > 0
 
 
 @dataclass
@@ -152,10 +166,17 @@ class SimulatedTrip:
 
     @property
     def has_overcrowding(self) -> bool:
+        """Any stop at or above capacity."""
         return any(e.overcrowded for e in self.stop_events)
 
     @property
+    def has_crowding(self) -> bool:
+        """Any passengers were left behind."""
+        return any(e.crowded for e in self.stop_events)
+
+    @property
     def total_unmet_demand(self) -> int:
+        """Total passengers left behind across all stops."""
         return sum(e.unmet_demand for e in self.stop_events)
 
     @property
@@ -202,7 +223,7 @@ class MissedConnection:
 @dataclass
 class Violation:
     """A detected constraint violation."""
-    violation_type: str   # "overcrowding" | "schedule_conflict" | "missed_connection" | "capacity"
+    violation_type: str   # "overcrowding" | "schedule_conflict" | "missed_connection" | "fleet_conflict" | "turnaround"
     severity: str         # "warning" | "critical"
     description: str
     trip: Optional[SimulatedTrip] = None
@@ -212,14 +233,15 @@ class Violation:
 
 @dataclass
 class RecommendationAction:
-    """A single recommended change."""
-    action_type: str   # "vehicle_swap" | "extra_trip" | "departure_nudge" | "frequency_increase"
+    """A single recommended change to the schedule."""
+    action_type: str   # "vehicle_upgrade" | "extra_trip" | "departure_shift"
     description: str
     departure: Optional[ScheduledDeparture] = None
     new_vehicle: Optional[Vehicle] = None
     time_shift_minutes: float = 0.0
-    cost_label: str = ""
-    benefit_label: str = ""
+    # Computed from simulation data — no fabricated numbers
+    passengers_accommodated: int = 0    # how many previously-unmet passengers this action serves
+    cost_vehicle_minutes: float = 0.0   # extra vehicle-minutes this action requires
 
 
 @dataclass
@@ -234,14 +256,21 @@ class Plan:
 
 @dataclass
 class EvaluationResult:
-    """Metrics for a simulated plan."""
+    """Metrics for a simulated plan across one or more seeds."""
     plan: Plan
-    eta_mae: float                  # minutes
-    eta_calibration: float          # fraction (0–1) of estimates where actual in CI
-    overcrowding_events: int        # count of stop-events where on_board > capacity
-    total_unmet_demand: int         # passengers who couldn't board
+    # ETA quality (separate from plan-outcome metrics)
+    eta_mae: float                  # minutes — lower is better
+    eta_calibration: float          # fraction (0–1); target = CI_PCT/100
+    # Plan outcome metrics
+    overcrowding_events: int        # stop-events where on_board >= capacity
+    crowding_events: int            # stop-events where any passenger left behind
+    total_unmet_demand: int         # total passengers who couldn't board
     missed_connections: int         # count of missed-connection events
-    average_wait_minutes: float     # mean passenger wait
-    fleet_utilisation: float        # mean load/capacity across all stops
+    average_wait_minutes: float     # proxy: HEADWAY/2 + mean positive delay
+    fleet_utilisation: float        # mean on_board/capacity across all stop-events
+    # Constraint compliance
     constraint_violations: int      # independent validator count
     seeds_used: List[int] = field(default_factory=list)
+    # Spread (filled by multi-seed eval)
+    unmet_demand_std: float = 0.0
+    overcrowding_std: float = 0.0

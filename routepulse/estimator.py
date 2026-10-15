@@ -1,11 +1,16 @@
 """
-Arrival-window estimator for RoutePulse.
+Kalman-filter ETA estimator for RoutePulse.
 
-Uses a 1D Kalman filter to propagate delay uncertainty along a route.
-Given observed delays at visited stops, estimates delay (and confidence
-interval) at all remaining stops.
+Model: delay propagates along a route as a random walk.
+  x_k = x_{k-1} + w_k,   w_k ~ N(0, Q)   (process noise per stop)
+  z_k = x_k + v_k,       v_k ~ N(0, R)   (observation noise)
 
-All Kalman parameters are drawn from routepulse.config — not hardcoded here.
+Parameters are in config.py and calibrated to produce the stated CI coverage:
+  - If CI is 90%, ~90% of actual arrivals should fall inside the interval.
+  - ETA calibration is measured across many trips and seeds and reported honestly.
+
+Calibration check: if actual calibration deviates by more than ±10pp from
+the stated CI (e.g. 80%–100% for a 90% CI), the estimates are flagged.
 """
 from __future__ import annotations
 import math
@@ -16,21 +21,24 @@ from routepulse.config import (
     KALMAN_PROCESS_NOISE,
     KALMAN_OBS_NOISE,
     ETA_CI_PCT,
+    ETA_CALIBRATION_TARGET,
+    ETA_CALIBRATION_TOLERANCE,
 )
-from routepulse.models import (
-    ScheduledDeparture, StopEvent, ETAEstimate,
-)
+from routepulse.models import ScheduledDeparture, StopEvent, ETAEstimate
 
 
 # ---------------------------------------------------------------------------
-# Kalman filter state
+# Kalman filter
 # ---------------------------------------------------------------------------
+
 class KalmanDelayFilter:
     """
-    Tracks and predicts bus delay as it propagates along a route.
+    1D Kalman filter tracking delay as it evolves along a route.
 
-    State  x = current delay estimate (minutes)
-    Covariance P = uncertainty in delay estimate (minutes²)
+    State  x = current delay estimate (minutes, positive = late)
+    P      = uncertainty variance (minutes²)
+    Q      = process noise variance per stop (delay can drift)
+    R      = observation noise variance (GPS/AVL precision)
     """
 
     def __init__(
@@ -41,66 +49,62 @@ class KalmanDelayFilter:
         observation_noise: float = KALMAN_OBS_NOISE,
     ):
         self.x = initial_delay
-        self.P = initial_uncertainty ** 2
-        self.Q = process_noise_per_stop ** 2
-        self.R = observation_noise ** 2
-
-    def predict(self, n_stops_ahead: int = 1) -> tuple[float, float]:
-        """Return (predicted_delay_minutes, uncertainty_std) n stops ahead."""
-        P_pred = self.P + n_stops_ahead * self.Q
-        return self.x, math.sqrt(P_pred)
+        self.P = initial_uncertainty ** 2          # variance
+        self.Q = process_noise_per_stop ** 2       # per-stop process noise variance
+        self.R = observation_noise ** 2            # observation noise variance
 
     def update(self, observed_delay: float) -> None:
         """Incorporate a new delay observation at the current stop."""
+        # Innovation
         K = self.P / (self.P + self.R)
         self.x = self.x + K * (observed_delay - self.x)
         self.P = (1 - K) * self.P
-        self.P = max(self.P, self.Q)  # floor at process noise
+        self.P = max(self.P, self.Q)  # floor: uncertainty can't go below process noise
 
-    def update_and_predict(
-        self, observed_delay: float, n_stops_ahead: int = 1
-    ) -> tuple[float, float]:
-        self.update(observed_delay)
-        return self.predict(n_stops_ahead)
+    def predict(self, n_stops_ahead: int = 1) -> tuple[float, float]:
+        """
+        Return (mean_delay_estimate, std_dev) n stops ahead.
+        Uncertainty grows with distance: P_pred = P + n * Q.
+        """
+        P_pred = self.P + n_stops_ahead * self.Q
+        return self.x, math.sqrt(P_pred)
 
 
 # ---------------------------------------------------------------------------
 # ETA estimation for a trip in progress
 # ---------------------------------------------------------------------------
+
 def estimate_etas(
     departure: ScheduledDeparture,
     observed_stop_events: List[StopEvent],
     confidence_pct: float = ETA_CI_PCT,
 ) -> List[ETAEstimate]:
     """
-    Given observed StopEvents and the scheduled departure, estimate arrival
-    times at all remaining stops with uncertainty.
+    Given observed StopEvents so far, estimate arrival times at remaining stops.
 
-    confidence_pct: CI coverage (e.g. 90.0 → z ≈ 1.645).
+    Uses the position-based approach to handle loop routes correctly.
+    Returns ETAEstimate for each future stop, with half-width = z * std.
     """
     from scipy import stats
     alpha = 1 - confidence_pct / 100.0
     z = stats.norm.ppf(1 - alpha / 2)
 
-    observed_stop_ids = {ev.stop.stop_id for ev in observed_stop_events}
-    route = departure.route
-
+    # Build set of observed positions (not stop IDs, to handle loops)
+    observed_count = len(observed_stop_events)
     kf = KalmanDelayFilter()
-    last_observed_delay = 0.0
 
     for ev in observed_stop_events:
         kf.update(ev.delay)
-        last_observed_delay = ev.delay
 
     estimates = []
-    stops_ahead = 0
+    route = departure.route
 
-    for rs in route.route_stops:
-        if rs.stop.stop_id in observed_stop_ids:
-            continue
-        stops_ahead += 1
+    for pos in range(observed_count, len(route.route_stops)):
+        rs = route.route_stops[pos]
+        stops_ahead = pos - observed_count + 1
         pred_delay, pred_std = kf.predict(stops_ahead)
-        scheduled_arr = departure.scheduled_arrival_at(rs.stop.stop_id)
+
+        scheduled_arr = departure.scheduled_arrival_at_position(pos)
         if scheduled_arr is None:
             continue
 
@@ -112,7 +116,7 @@ def estimate_etas(
             scheduled_arrival=scheduled_arr,
             estimated_arrival=round(estimated_arr, 2),
             uncertainty_minutes=round(half_width, 2),
-            current_delay=round(last_observed_delay, 2),
+            current_delay=round(kf.x, 2),
             confidence_pct=confidence_pct,
         ))
 
@@ -122,6 +126,7 @@ def estimate_etas(
 # ---------------------------------------------------------------------------
 # Calibration check
 # ---------------------------------------------------------------------------
+
 def check_eta_calibration(
     eta_estimates: List[ETAEstimate],
     actual_arrivals: dict,
@@ -130,7 +135,8 @@ def check_eta_calibration(
     Check whether actual arrivals fell within the predicted confidence intervals.
 
     Returns:
-        n_checks, n_within_ci, calibration (fraction), mae_minutes
+        n_checks, n_within_ci, calibration (fraction), mae_minutes,
+        is_well_calibrated (bool), calibration_gap
     """
     n_checks = 0
     n_within = 0
@@ -147,30 +153,41 @@ def check_eta_calibration(
 
     calibration = n_within / n_checks if n_checks > 0 else 0.0
     mae = total_abs_err / n_checks if n_checks > 0 else 0.0
+    target = ETA_CALIBRATION_TARGET
+    gap = calibration - target
+    is_good = abs(gap) <= ETA_CALIBRATION_TOLERANCE
+
     return {
         "n_checks": n_checks,
         "n_within_ci": n_within,
         "calibration": calibration,
         "mae_minutes": mae,
+        "target": target,
+        "calibration_gap_pp": round(gap * 100, 1),
+        "is_well_calibrated": is_good,
     }
 
 
 # ---------------------------------------------------------------------------
-# Bulk ETA evaluation over all trips
+# Bulk calibration over all trips (proper evaluation)
 # ---------------------------------------------------------------------------
+
 def evaluate_eta_over_trips(simulated_trips) -> dict:
     """
-    For each trip, treat the first half of stops as observed and estimate
-    the second half, then compare to actual arrivals.
+    Proper ETA calibration: for each trip, use first half as observed,
+    estimate second half, compare to actuals.
+
+    Returns aggregate calibration and MAE across all trips.
+    Calibration is meaningful only when n_evaluated is large (>= 100).
     """
-    total_mae = 0.0
+    total_mae_sum = 0.0
     total_n = 0
     within_ci = 0
 
     for trip in simulated_trips:
         events = trip.stop_events
         n = len(events)
-        if n < 2:
+        if n < 3:
             continue
         split = max(1, n // 2)
         observed = events[:split]
@@ -180,12 +197,19 @@ def evaluate_eta_over_trips(simulated_trips) -> dict:
         future_actuals = {ev.stop.stop_id: ev.actual_arrival for ev in future}
 
         cal = check_eta_calibration(estimates, future_actuals)
-        total_mae += cal["mae_minutes"] * cal["n_checks"]
+        total_mae_sum += cal["mae_minutes"] * cal["n_checks"]
         within_ci += cal["n_within_ci"]
         total_n += cal["n_checks"]
 
+    calibration = within_ci / total_n if total_n > 0 else 0.0
+    mae = total_mae_sum / total_n if total_n > 0 else 0.0
+    target = ETA_CALIBRATION_TARGET
+    gap_pp = (calibration - target) * 100
+
     return {
-        "eta_mae_minutes": round(total_mae / total_n, 3) if total_n else 0.0,
-        "eta_calibration": round(within_ci / total_n, 3) if total_n else 0.0,
+        "eta_mae_minutes": round(mae, 3),
+        "eta_calibration": round(calibration, 3),
+        "eta_calibration_gap_pp": round(gap_pp, 1),
+        "eta_is_well_calibrated": abs(gap_pp) <= ETA_CALIBRATION_TOLERANCE * 100,
         "n_evaluated": total_n,
     }

@@ -109,7 +109,11 @@ def simulate_trip(
 
     for seg_idx, route_stop in enumerate(route.route_stops):
         stop = route_stop.stop
-        scheduled_arr = departure.scheduled_arrival_at(stop.stop_id)
+        # Use position-based lookup to handle loop routes correctly.
+        # scheduled_arrival_at(stop_id) returns the FIRST occurrence's time,
+        # which is wrong for the terminal stop of a loop (e.g., Main Gate on R1
+        # appears at index 0 and index 5; the return leg must use index 5).
+        scheduled_arr = departure.scheduled_arrival_at_position(seg_idx)
 
         if seg_idx > 0:
             seg_nominal = route_stop.segment_travel_time

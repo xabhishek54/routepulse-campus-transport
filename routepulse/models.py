@@ -77,10 +77,15 @@ class Route:
         return self.route_stops[-1].cumulative_time if self.route_stops else 0.0
 
     def stop_index(self, stop_id: str) -> Optional[int]:
+        """Return the index of the FIRST occurrence of this stop on the route."""
         for i, rs in enumerate(self.route_stops):
             if rs.stop.stop_id == stop_id:
                 return i
         return None
+
+    def stop_indices(self, stop_id: str) -> List[int]:
+        """Return ALL indices where this stop appears (needed for loop routes)."""
+        return [i for i, rs in enumerate(self.route_stops) if rs.stop.stop_id == stop_id]
 
 
 @dataclass
@@ -92,12 +97,28 @@ class ScheduledDeparture:
     departure_time: float
     vehicle: Vehicle
 
-    def scheduled_arrival_at(self, stop_id: str) -> Optional[float]:
-        """Return the scheduled arrival time at a given stop, or None if not on this route."""
-        idx = self.route.stop_index(stop_id)
-        if idx is None:
+    def scheduled_arrival_at(self, stop_id: str, occurrence: int = 0) -> Optional[float]:
+        """
+        Return the scheduled arrival time at a given stop.
+
+        occurrence=0 means first occurrence (departure stop for loops).
+        occurrence=-1 means last occurrence (arrival stop for loop terminals).
+        Pass occurrence=-1 when computing the return leg of a loop route.
+        """
+        indices = self.route.stop_indices(stop_id)
+        if not indices:
             return None
+        if occurrence == -1:
+            idx = indices[-1]
+        else:
+            idx = indices[min(occurrence, len(indices) - 1)]
         return self.departure_time + self.route.route_stops[idx].cumulative_time
+
+    def scheduled_arrival_at_position(self, position: int) -> Optional[float]:
+        """Return scheduled arrival at the nth stop (0-indexed). Unambiguous even for loops."""
+        if 0 <= position < len(self.route.route_stops):
+            return self.departure_time + self.route.route_stops[position].cumulative_time
+        return None
 
 
 @dataclass

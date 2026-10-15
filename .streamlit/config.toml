@@ -1,3 +1,6 @@
+[ui]
+hideTopBar = true
+
 [theme]
 base = "dark"
 primaryColor = "#60a5fa"

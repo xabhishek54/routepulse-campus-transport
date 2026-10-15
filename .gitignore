@@ -52,8 +52,6 @@ secrets/
 logs/
 *.log
 
-# Allow Streamlit config (needed for Cloud deployment)
-!.streamlit/config.toml
-
-# Allow all root-level markdown
-!*.md
+# Markdown — only README goes to GitHub; planning docs stay local
+*.md
+!README.md

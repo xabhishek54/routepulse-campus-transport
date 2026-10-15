@@ -4,38 +4,32 @@ __pycache__/
 *$py.class
 *.so
 .Python
-env/
-venv/
-.venv/
-ENV/
 *.egg-info/
 dist/
 build/
 .eggs/
 *.egg
 pip-log.txt
-pip-delete-this-directory.txt
 
-# Virtual environments
+# Virtual environments — never commit these
+env/
 venv/
 .venv/
-env/
+ENV/
 .env
 
 # Jupyter
 .ipynb_checkpoints/
 *.ipynb
 
-# Data / generated outputs (keep small seed data, ignore large generated files)
+# Data / generated outputs
 data/generated/
 *.csv.bak
 *.parquet
 
-# Node
+# Node (not used, just safety)
 node_modules/
 npm-debug.log*
-yarn-error.log*
-.pnpm-debug.log*
 
 # IDE
 .vscode/
@@ -48,16 +42,18 @@ yarn-error.log*
 .DS_Store
 Thumbs.db
 
-# Secrets
-.env
+# Secrets — never commit
 *.key
 *.pem
 secrets/
+.streamlit/secrets.toml
 
 # Logs
 logs/
 *.log
 
-# Markdown policy - allow important docs
-# Allow all markdown docs at root level
+# Allow Streamlit config (needed for Cloud deployment)
+!.streamlit/config.toml
+
+# Allow all root-level markdown
 !*.md

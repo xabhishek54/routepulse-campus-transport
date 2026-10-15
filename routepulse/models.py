@@ -265,12 +265,15 @@ class EvaluationResult:
     overcrowding_events: int        # stop-events where on_board >= capacity
     crowding_events: int            # stop-events where any passenger left behind
     total_unmet_demand: int         # total passengers who couldn't board
-    missed_connections: int         # count of missed-connection events
-    average_wait_minutes: float     # proxy: HEADWAY/2 + mean positive delay
-    fleet_utilisation: float        # mean on_board/capacity across all stop-events
+    passengers_served: int = 0      # total passengers who boarded
+    service_rate: float = 0.0       # boarded / total_demand
+    missed_connections: int = 0     # count of missed-connection events
+    average_wait_minutes: float = 0.0  # proxy: HEADWAY/2 + mean positive delay
+    fleet_utilisation: float = 0.0  # mean on_board/capacity across all stop-events
     # Constraint compliance
-    constraint_violations: int      # independent validator count
+    constraint_violations: int = 0  # independent validator count
     seeds_used: List[int] = field(default_factory=list)
     # Spread (filled by multi-seed eval)
     unmet_demand_std: float = 0.0
     overcrowding_std: float = 0.0
+    service_rate_std: float = 0.0

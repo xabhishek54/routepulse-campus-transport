@@ -132,8 +132,13 @@ class DemandForecaster:
         self.is_fitted = False
         self.train_mae: Optional[float] = None
         self.holdout_mae: Optional[float] = None
+        self.improvement_pct: float = 0.0   # vs naive (last-slot) baseline
+        self.horizon_steps: int = FORECAST_HORIZON_STEPS
+        self.train_seeds: List[int] = []
+        self.holdout_seeds: List[int] = []
         self._enc: Optional[OrdinalEncoder] = None
         self._model: Optional[GradientBoostingRegressor] = None
+        self._train_df: Optional[pd.DataFrame] = None  # cached for predict_stop
 
     # ── Training ─────────────────────────────────────────────────────────────
 
@@ -143,6 +148,7 @@ class DemandForecaster:
             raise ValueError(
                 f"Need at least {FORECAST_MIN_TRAIN_SAMPLES} samples, got {len(df)}"
             )
+        self._train_df = df.copy()
         X, y = self._prepare(df, fit_encoder=True)
         self._model = GradientBoostingRegressor(
             n_estimators=self._n_estimators,
@@ -153,6 +159,15 @@ class DemandForecaster:
         self._model.fit(X, y)
         preds = self._model.predict(X)
         self.train_mae = float(mean_absolute_error(y, preds))
+
+        # Compare to naive baseline (predict same value as previous slot)
+        if len(y) > 1:
+            naive_preds = np.roll(y, 1)
+            naive_preds[0] = y[0]
+            naive_mae = float(mean_absolute_error(y, naive_preds))
+            if naive_mae > 0:
+                self.improvement_pct = (naive_mae - self.train_mae) / naive_mae * 100
+
         self.is_fitted = True
         return self
 
@@ -263,6 +278,59 @@ class DemandForecaster:
             .reset_index(drop=True)
         )
 
+    def predict_stop(
+        self,
+        stop_id: str,
+        seed: int = 42,
+        n_context_slots: int = 8,
+    ) -> Optional[pd.DataFrame]:
+        """
+        Generate a forecast time-series for a stop.
+
+        Uses cached training data to build a realistic lag history,
+        then forecasts the next FORECAST_HORIZON_STEPS slots.
+
+        Returns a DataFrame with columns: time_min, predicted, actual (if available), naive.
+        """
+        if not self.is_fitted or self._train_df is None:
+            return None
+        stop_data = self._train_df[
+            (self._train_df["stop_id"] == stop_id) &
+            (self._train_df["seed"] == seed)
+        ].sort_values("hour") if "seed" in self._train_df.columns else (
+            self._train_df[self._train_df["stop_id"] == stop_id].sort_values("hour")
+        )
+
+        if stop_data.empty or len(stop_data) < n_context_slots:
+            return None
+
+        # Use last n_context_slots as the lag context
+        context = stop_data.tail(n_context_slots)
+        last_time = float(context["hour"].iloc[-1]) * 60
+        lag_demands = list(context["label"].values)
+
+        # Forecast horizon
+        horizon = self.predict_horizon(stop_id, last_time, lag_demands)
+        actual_map = dict(zip(stop_data["hour"] * 60, stop_data["label"]))
+
+        rows = []
+        prev_demand = lag_demands[-1] if lag_demands else 0
+        for t, pred, unc in horizon:
+            actual = actual_map.get(t)
+            rows.append({
+                "time_min": t,
+                "predicted": max(0, round(pred, 1)),
+                "actual": round(float(actual), 1) if actual is not None else None,
+                "naive": round(float(prev_demand), 1),
+                "uncertainty": round(unc, 1),
+            })
+            prev_demand = pred
+
+        df_out = pd.DataFrame(rows)
+        if df_out["actual"].isna().all():
+            df_out = df_out.drop(columns=["actual"])
+        return df_out
+
 
 # ---------------------------------------------------------------------------
 # Convenience: train from scratch on multi-seed data
@@ -282,21 +350,37 @@ def train_forecaster(
     Returns:
         Fitted DemandForecaster with .train_mae and .holdout_mae populated.
     """
-    from routepulse.data_gen import build_campus, build_baseline_plan
+    from routepulse.data_gen import build_campus, build_naive_baseline
     from routepulse.simulator import simulate_plan
 
     stops, routes, vehicles, departures = build_campus()
-    baseline = build_baseline_plan(departures=departures)
+    baseline = build_naive_baseline(departures=departures)
 
     train_trips = {s: simulate_plan(baseline, base_seed=s) for s in train_seeds}
     df_train = build_training_data(train_trips)
+    # Store seed info in df for predict_stop
+    df_train["seed"] = df_train.get("seed", train_seeds[0] if train_seeds else 42)
 
     forecaster = DemandForecaster()
+    forecaster.train_seeds = list(train_seeds)
+    forecaster.holdout_seeds = list(holdout_seeds) if holdout_seeds else []
     forecaster.fit(df_train)
 
     if holdout_seeds:
         holdout_trips = {s: simulate_plan(baseline, base_seed=s) for s in holdout_seeds}
         df_holdout = build_training_data(holdout_trips)
         forecaster.evaluate_holdout(df_holdout)
+
+        # Recompute improvement_pct using holdout MAE (more honest)
+        if df_holdout is not None and len(df_holdout) > 1:
+            _, y_h = forecaster._prepare(df_holdout, fit_encoder=False)
+            if y_h is not None and len(y_h) > 1:
+                naive_preds = np.roll(y_h, 1)
+                naive_preds[0] = y_h[0]
+                naive_mae = float(mean_absolute_error(y_h, naive_preds))
+                if naive_mae > 0:
+                    forecaster.improvement_pct = (
+                        (naive_mae - forecaster.holdout_mae) / naive_mae * 100
+                    )
 
     return forecaster

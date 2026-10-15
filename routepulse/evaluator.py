@@ -164,6 +164,8 @@ def evaluate_plan_multi_seed(
         overcrowding_events=round(_mean("overcrowding_events")),
         crowding_events=round(_mean("crowding_events")),
         total_unmet_demand=round(_mean("total_unmet_demand")),
+        passengers_served=round(_mean("passengers_served")),
+        service_rate=round(_mean("service_rate"), 4),
         missed_connections=round(_mean("missed_connections")),
         average_wait_minutes=round(_mean("average_wait_minutes"), 2),
         fleet_utilisation=round(_mean("fleet_utilisation"), 3),
@@ -171,6 +173,7 @@ def evaluate_plan_multi_seed(
         seeds_used=list(seeds),
         unmet_demand_std=round(_std("total_unmet_demand"), 1),
         overcrowding_std=round(_std("overcrowding_events"), 1),
+        service_rate_std=round(_std("service_rate"), 4),
     )
 
 

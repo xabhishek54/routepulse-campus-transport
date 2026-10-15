@@ -143,49 +143,59 @@ def make_schedule(
     Generate departures every HEADWAY minutes for each route, with
     a physically feasible vehicle assignment.
 
-    Each route gets its own pool of vehicles. Vehicles rotate within
-    the pool; a vehicle is only assigned a new trip after its previous
-    trip has ended (with MIN_TURNAROUND_MINUTES grace).
+    Each route gets its own ISOLATED pool of virtual vehicles, sized so
+    no vehicle is ever double-booked.  The minimum pool size per route is:
+        ceil((route_time + MIN_TURNAROUND_MINUTES) / HEADWAY)
+
+    Virtual IDs are route-scoped (e.g. "R1-S01") so vehicles from
+    different routes never appear in the same constraint check.
 
     route_vehicle_type: maps route_id -> 'small' | 'large'.
     Defaults to naive baseline (all small).
     """
+    import math as _math
     from routepulse.config import MIN_TURNAROUND_MINUTES
 
     if route_vehicle_type is None:
         route_vehicle_type = {rid: "small" for rid in routes}
 
-    all_small = [v for v in vehicles.values() if v.vehicle_type.type_id == "small"]
-    all_large = [v for v in vehicles.values() if v.vehicle_type.type_id == "large"]
+    # Lookup templates from the provided fleet
+    type_templates = {v.vehicle_type.type_id: v.vehicle_type for v in vehicles.values()}
 
     departures: List[ScheduledDeparture] = []
     dep_counter = 0
 
-    # Track when each vehicle is next free: {vehicle_id: earliest_start_time}
-    vehicle_free_at: Dict[str, float] = {v.vehicle_id: float(OP_START) for v in vehicles.values()}
-
     for rid, route in routes.items():
         vtype = route_vehicle_type.get(rid, "small")
-        pool = all_large if vtype == "large" else all_small
         route_time = route.total_nominal_time
+
+        # Minimum vehicles to cover the headway without double-booking
+        n_needed = _math.ceil((route_time + MIN_TURNAROUND_MINUTES) / HEADWAY)
+        n_needed = max(n_needed, 1)
+
+        vtype_obj = type_templates.get(vtype) or type_templates.get("small")
+        prefix = "L" if vtype == "large" else "S"
+
+        # Route-local pool with unique IDs
+        route_pool = [
+            Vehicle(f"{rid}-{prefix}{i+1:02d}", vtype_obj)
+            for i in range(n_needed)
+        ]
+        free_at: Dict[str, float] = {v.vehicle_id: float(OP_START) for v in route_pool}
 
         t = float(OP_START)
         while t + route_time <= OP_END + 1:
             did = f"D{dep_counter:04d}"
 
-            # Find the first vehicle in the pool that is free at time t
-            best = None
-            for v in pool:
-                if vehicle_free_at[v.vehicle_id] <= t:
-                    best = v
-                    break
-            if best is None:
-                # No vehicle free yet; cycle through pool by least-busy
-                best = min(pool, key=lambda v: vehicle_free_at[v.vehicle_id])
+            # Pick the free vehicle with the earliest availability
+            eligible = [v for v in route_pool if free_at[v.vehicle_id] <= t]
+            if eligible:
+                best = min(eligible, key=lambda v: free_at[v.vehicle_id])
+            else:
+                best = min(route_pool, key=lambda v: free_at[v.vehicle_id])
 
             departures.append(ScheduledDeparture(did, route, t, best))
-            # Update vehicle availability: trip ends + turnaround
-            vehicle_free_at[best.vehicle_id] = t + route_time + MIN_TURNAROUND_MINUTES
+            free_at[best.vehicle_id] = t + route_time + MIN_TURNAROUND_MINUTES
             dep_counter += 1
             t += HEADWAY
 

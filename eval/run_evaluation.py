@@ -1,172 +1,197 @@
 #!/usr/bin/env python3
 """
-One-command reproducible evaluation for RoutePulse.
+RoutePulse full evaluation script.
 
-Usage:
-    python eval/run_evaluation.py
+Reproduces all numbers in the report:
+  - Per-seed metrics for all three plans (naive, rule-based, RoutePulse)
+  - Mean ± std across 11 seeds
+  - ETA calibration
+  - Demand forecaster holdout MAE
 
-This script:
-  1. Generates campus data with SEED=42
-  2. Simulates baseline, smarter baseline, and recommended plans
-  3. Runs multi-seed evaluation (seeds 42-52)
-  4. Prints the comparison table
-  5. Saves results to eval/results.json
-
-All randomness is seeded for full reproducibility.
+Output: Markdown report to stdout and eval/report.md.
 """
-import sys
 import os
-import json
+import sys
+import time
 
-# Allow running from repo root
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from routepulse.data_gen import build_campus, build_baseline_plan, build_smarter_baseline_plan
+from routepulse.config import EVAL_SEEDS
+from routepulse.data_gen import build_campus, build_naive_baseline, build_smarter_baseline_plan
 from routepulse.simulator import simulate_plan
 from routepulse.detector import detect_all
-from routepulse.optimizer import build_recommended_plan, tradeoff_summary
-from routepulse.evaluator import (
-    evaluate_plan_multi_seed, comparison_table, improvement_table,
-    compute_multi_seed_ci,
-)
+from routepulse.optimizer import build_recommended_plan, action_summary
+from routepulse.evaluator import evaluate_plan_multi_seed, comparison_table, improvement_table
 from routepulse.validator import validate
+from routepulse.estimator import evaluate_eta_over_trips
+from routepulse.forecaster import train_forecaster
 
-EVAL_SEEDS = list(range(42, 53))  # seeds 42–52 for robustness
+
+def section(title: str) -> None:
+    print(f"\n{'='*60}")
+    print(f"  {title}")
+    print(f"{'='*60}")
+
+
+def fmt_float(v) -> str:
+    if v is None:
+        return "N/A"
+    if isinstance(v, float):
+        return f"{v:.3f}"
+    return str(v)
 
 
 def main():
-    print("=" * 60)
-    print("  RoutePulse — Evaluation Report")
-    print("=" * 60)
-    print(f"\nEvaluation seeds: {EVAL_SEEDS[0]}–{EVAL_SEEDS[-1]} ({len(EVAL_SEEDS)} seeds)")
-    print("Campus: Westbrook University (synthetic)")
-    print("Window: 08:00–20:00, typical Tuesday\n")
+    t0 = time.time()
+    seeds = list(EVAL_SEEDS)
+    n = len(seeds)
 
-    # ----------------------------------------------------------------
-    # Build campus
-    # ----------------------------------------------------------------
+    print(f"RoutePulse Evaluation Report")
+    print(f"Seeds: {seeds[0]}–{seeds[-1]} ({n} runs)")
+    print(f"Started: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+    # ── Build campus ──────────────────────────────────────────────────────────
+    section("Building campus")
     stops, routes, vehicles, departures = build_campus()
-    print(f"Campus: {len(stops)} stops, {len(routes)} routes, {len(vehicles)} vehicles")
-    print(f"Schedule: {len(departures)} departures\n")
+    naive   = build_naive_baseline(departures=departures)
+    smarter = build_smarter_baseline_plan(routes=routes, vehicles=vehicles)
+    print(f"  Stops: {len(stops)}, Routes: {len(routes)}, Vehicles: {len(vehicles)}")
+    print(f"  Departures/day: {len(naive.departures)} (naive), {len(smarter.departures)} (rule-based)")
 
-    # ----------------------------------------------------------------
-    # Plans
-    # ----------------------------------------------------------------
-    baseline = build_baseline_plan(departures=departures)
-    smarter  = build_smarter_baseline_plan(stops=stops, routes=routes, vehicles=vehicles)
+    # ── Validate baselines ────────────────────────────────────────────────────
+    section("Validating baseline plans")
+    for plan in [naive, smarter]:
+        r = validate(plan)
+        status = "PASS" if r.passed else f"FAIL ({r.n_violations} violations)"
+        print(f"  {plan.name}: {status}")
+        if not r.passed:
+            for c in r.checks:
+                if not c.passed:
+                    print(f"    FAIL: {c.constraint}: {c.detail[:80]}")
 
-    # Generate recommended plan from seed-42 simulation
-    print("Generating recommended plan (seed 42)...")
-    trips_42 = simulate_plan(baseline, base_seed=42)
-    det = detect_all(baseline, trips_42)
-    recommended = build_recommended_plan(baseline, trips_42, det["missed_connections"])
-    ts = tradeoff_summary(recommended.actions_applied)
-    print(f"  Vehicle upgrades: {ts['vehicle_upgrades']}")
-    print(f"  Extra trips:      {ts['extra_trips']}")
-    print(f"  Departure nudges: {ts['departure_nudges']}\n")
+    # ── Build optimised plan (using seed 42 as the "current day") ─────────────
+    section("Building RoutePulse recommended plan (seed 42)")
+    trips_42 = simulate_plan(naive, base_seed=42)
+    det_42   = detect_all(naive, trips_42)
+    optimised = build_recommended_plan(naive, trips_42, det_42["missed_connections"])
+    val_opt  = validate(optimised)
+    acts     = action_summary(optimised.actions_applied)
+    print(f"  Plan: {optimised.plan_id}")
+    print(f"  Validator: {'PASS' if val_opt.passed else 'FAIL'}")
+    print(f"  Actions: {acts}")
 
-    # ----------------------------------------------------------------
-    # Validate all plans (independent checker)
-    # ----------------------------------------------------------------
-    print("Constraint validation (independent checker):")
-    for plan in [baseline, smarter, recommended]:
-        report = validate(plan)
-        status = "PASS ✓" if report.passed else f"FAIL ✗ ({report.n_violations} violations)"
-        print(f"  {plan.name:35s}: {status}")
-    print()
+    # ── Multi-seed evaluation ─────────────────────────────────────────────────
+    section(f"Multi-seed evaluation ({n} seeds)")
+    print("  Running... (this may take ~30 seconds)")
 
-    # ----------------------------------------------------------------
-    # Multi-seed evaluation
-    # ----------------------------------------------------------------
-    print("Running multi-seed evaluation...")
-    results = []
-    for plan in [baseline, smarter, recommended]:
-        print(f"  Evaluating '{plan.name}'...", end="", flush=True)
-        er = evaluate_plan_multi_seed(plan, EVAL_SEEDS)
-        results.append(er)
-        print(" done")
+    er_naive    = evaluate_plan_multi_seed(naive, seeds)
+    er_smarter  = evaluate_plan_multi_seed(smarter, seeds)
+    er_optimised = evaluate_plan_multi_seed(optimised, seeds)
 
-    # ----------------------------------------------------------------
-    # Comparison table
-    # ----------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print("  COMPARISON TABLE (mean over 11 seeds)")
-    print("=" * 60)
-    rows = comparison_table(results)
-    # Print as simple aligned table
-    headers = list(rows[0].keys())
-    col_w = {h: max(len(h), max(len(str(r[h])) for r in rows)) + 2 for h in headers}
-    header_line = "  ".join(h.ljust(col_w[h]) for h in headers)
-    print(header_line)
-    print("-" * len(header_line))
-    for row in rows:
-        print("  ".join(str(row[h]).ljust(col_w[h]) for h in headers))
+    print(f"\n  {'Metric':30s}  {'Naive':>12s}  {'Rule-based':>12s}  {'RoutePulse':>12s}")
+    print(f"  {'-'*72}")
 
-    # ----------------------------------------------------------------
-    # Improvement table (baseline → recommended)
-    # ----------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print("  IMPROVEMENT: Naive Baseline → RoutePulse Recommendation")
-    print("=" * 60)
-    impr = improvement_table(results[0], results[2])
-    imp_headers = list(impr[0].keys())
-    imp_w = {h: max(len(h), max(len(str(r[h])) for r in impr)) + 2 for h in imp_headers}
-    imp_header_line = "  ".join(h.ljust(imp_w[h]) for h in imp_headers)
-    print(imp_header_line)
-    print("-" * len(imp_header_line))
-    for row in impr:
-        print("  ".join(str(row[h]).ljust(imp_w[h]) for h in imp_headers))
+    metrics = [
+        ("service_rate",        "Service rate",          True),
+        ("crowding_events",     "Crowded stops",          False),
+        ("total_unmet_demand",  "Passengers left behind", False),
+        ("missed_connections",  "Missed connections",     False),
+        ("average_wait_minutes","Avg wait (min)",          False),
+        ("fleet_utilisation",   "Fleet utilisation",      True),
+        ("eta_mae",             "ETA MAE (min)",          False),
+        ("eta_calibration",     "ETA calibration",        True),
+        ("constraint_violations","Constraint violations", False),
+    ]
 
-    # ----------------------------------------------------------------
-    # Sensitivity check
-    # ----------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print("  SENSITIVITY ANALYSIS")
-    print("=" * 60)
+    for attr, label, hib in metrics:
+        nv = getattr(er_naive, attr, None)
+        sv = getattr(er_smarter, attr, None)
+        ov = getattr(er_optimised, attr, None)
 
-    from routepulse.simulator import simulate_plan as sim
-    from routepulse.evaluator import compute_metrics
+        def _fmt(v, is_pct=False):
+            if v is None:
+                return "  N/A"
+            if is_pct:
+                return f"  {v:.1%}"
+            if isinstance(v, float):
+                return f"  {v:.2f}"
+            return f"  {v}"
 
-    for travel_sigma, label in [(0.4, "Low noise (σ=0.4 min)"), (1.5, "High noise (σ=1.5 min)")]:
-        trips_sens = [
-            __import__("routepulse.simulator", fromlist=["simulate_trip"]).simulate_trip(
-                dep, base_seed=42, travel_time_noise_sigma=travel_sigma
-            )
-            for dep in baseline.departures
-        ]
-        trips_sens = [t for t in trips_sens if t is not None]
-        m = compute_metrics(baseline, trips_sens, 42)
-        print(f"\n  {label}:")
-        print(f"    ETA MAE: {m['eta_mae_minutes']:.3f} min")
-        print(f"    Overcrowding events: {m['overcrowding_events']}")
-        print(f"    Unmet demand: {m['total_unmet_demand']}")
+        is_pct = attr in ("service_rate", "fleet_utilisation", "eta_calibration")
+        rp_vs_naive   = "↑" if (hib and ov > nv) or (not hib and ov < nv) else ("=" if ov == nv else "↓")
+        rp_vs_smarter = "↑" if (hib and ov > sv) or (not hib and ov < sv) else ("=" if ov == sv else "↓")
+        print(
+            f"  {label:30s}"
+            f"{_fmt(nv, is_pct):>14s}"
+            f"{_fmt(sv, is_pct):>14s}"
+            f"{_fmt(ov, is_pct):>12s}"
+            f"   vs naive: {rp_vs_naive}  vs rule-based: {rp_vs_smarter}"
+        )
 
-    # ----------------------------------------------------------------
-    # Save results
-    # ----------------------------------------------------------------
-    out_path = os.path.join(os.path.dirname(__file__), "results.json")
-    output = {
-        "seeds": EVAL_SEEDS,
-        "plans": [
-            {
-                "plan_id": er.plan.plan_id,
-                "name": er.plan.name,
-                "eta_mae": er.eta_mae,
-                "eta_calibration": er.eta_calibration,
-                "overcrowding_events": er.overcrowding_events,
-                "total_unmet_demand": er.total_unmet_demand,
-                "missed_connections": er.missed_connections,
-                "average_wait_minutes": er.average_wait_minutes,
-                "fleet_utilisation": er.fleet_utilisation,
-                "constraint_violations": er.constraint_violations,
-            }
-            for er in results
-        ],
-    }
-    with open(out_path, "w") as f:
-        json.dump(output, f, indent=2)
-    print(f"\nResults saved to {out_path}")
-    print("\nEvaluation complete.")
+    # ── Seed spread ───────────────────────────────────────────────────────────
+    section("Seed spread (unmet demand std)")
+    print(f"  Naive     unmet demand std: {er_naive.unmet_demand_std:.1f}")
+    print(f"  Rule-based                : {er_smarter.unmet_demand_std:.1f}")
+    print(f"  RoutePulse                : {er_optimised.unmet_demand_std:.1f}")
+
+    # ── Demand forecaster ─────────────────────────────────────────────────────
+    section("Demand forecaster evaluation")
+    half = n // 2
+    train_seeds   = seeds[:half]
+    holdout_seeds = seeds[half:]
+    print(f"  Train seeds:   {train_seeds}")
+    print(f"  Holdout seeds: {holdout_seeds}")
+    print("  Training forecaster...")
+    fc = train_forecaster(train_seeds=train_seeds, holdout_seeds=holdout_seeds)
+    print(f"  Train MAE:   {fc.train_mae:.2f} pax/slot")
+    print(f"  Holdout MAE: {fc.holdout_mae:.2f} pax/slot")
+    print(f"  vs Naive:    {fc.improvement_pct:+.1f}% improvement")
+    calibrated = "well calibrated" if fc.holdout_mae < fc.train_mae * 1.5 else "may be overfitting"
+    print(f"  Assessment:  {calibrated}")
+
+    # ── ETA calibration detail ────────────────────────────────────────────────
+    section("ETA calibration detail (seed 42)")
+    eta_result = evaluate_eta_over_trips(trips_42)
+    print(f"  Calibration: {eta_result['eta_calibration']:.1%} (target 90%)")
+    print(f"  Gap from target: {eta_result['eta_calibration_gap_pp']:+.1f} pp")
+    print(f"  MAE: {eta_result['eta_mae_minutes']:.3f} min")
+    print(f"  n evaluated: {eta_result['n_evaluated']:,}")
+    print(f"  Well calibrated: {eta_result['eta_is_well_calibrated']}")
+
+    # ── Report file ───────────────────────────────────────────────────────────
+    elapsed = time.time() - t0
+    section(f"Done in {elapsed:.1f}s")
+
+    report_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "report.md")
+    with open(report_path, "w") as f:
+        f.write(f"# RoutePulse Evaluation Report\n\n")
+        f.write(f"Seeds: {seeds[0]}–{seeds[-1]} ({n} runs)  \n")
+        f.write(f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}  \n\n")
+        f.write("## Three-way comparison\n\n")
+        f.write(f"| Metric | Naive | Rule-based | RoutePulse | RP vs Naive | RP vs Rule-based |\n")
+        f.write(f"|--------|-------|------------|------------|-------------|------------------|\n")
+        for attr, label, hib in metrics:
+            nv = getattr(er_naive, attr, None)
+            sv = getattr(er_smarter, attr, None)
+            ov = getattr(er_optimised, attr, None)
+            def _md(v, is_pct=False):
+                if v is None: return "N/A"
+                if is_pct: return f"{v:.1%}"
+                return f"{v:.2f}" if isinstance(v, float) else str(v)
+            is_pct = attr in ("service_rate", "fleet_utilisation", "eta_calibration")
+            rn = "↑" if (hib and ov > nv) or (not hib and ov < nv) else ("=" if ov == nv else "↓")
+            rs = "↑" if (hib and ov > sv) or (not hib and ov < sv) else ("=" if ov == sv else "↓")
+            f.write(f"| {label} | {_md(nv,is_pct)} | {_md(sv,is_pct)} | {_md(ov,is_pct)} | {rn} | {rs} |\n")
+        f.write("\n## ETA calibration\n\n")
+        f.write(f"- Calibration: {eta_result['eta_calibration']:.1%} (target 90%, gap {eta_result['eta_calibration_gap_pp']:+.1f} pp)\n")
+        f.write(f"- MAE: {eta_result['eta_mae_minutes']:.3f} min\n")
+        f.write(f"- n evaluated: {eta_result['n_evaluated']:,}\n\n")
+        f.write("## Demand forecaster\n\n")
+        f.write(f"- Train MAE: {fc.train_mae:.2f} pax/slot\n")
+        f.write(f"- Holdout MAE: {fc.holdout_mae:.2f} pax/slot\n")
+        f.write(f"- vs Naive: {fc.improvement_pct:+.1f}%\n")
+
+    print(f"  Report saved to: {report_path}")
 
 
 if __name__ == "__main__":

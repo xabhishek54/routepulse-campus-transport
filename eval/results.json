@@ -1,0 +1,53 @@
+{
+  "seeds": [
+    42,
+    43,
+    44,
+    45,
+    46,
+    47,
+    48,
+    49,
+    50,
+    51,
+    52
+  ],
+  "plans": [
+    {
+      "plan_id": "baseline_naive",
+      "name": "Naive Baseline",
+      "eta_mae": 0.837,
+      "eta_calibration": 0.486,
+      "overcrowding_events": 0,
+      "total_unmet_demand": 1505,
+      "missed_connections": 8,
+      "average_wait_minutes": 8.36,
+      "fleet_utilisation": 0.596,
+      "constraint_violations": 0
+    },
+    {
+      "plan_id": "baseline_smarter",
+      "name": "Smarter Baseline",
+      "eta_mae": 0.837,
+      "eta_calibration": 0.486,
+      "overcrowding_events": 0,
+      "total_unmet_demand": 685,
+      "missed_connections": 8,
+      "average_wait_minutes": 8.36,
+      "fleet_utilisation": 0.495,
+      "constraint_violations": 0
+    },
+    {
+      "plan_id": "routepulse_recommended",
+      "name": "RoutePulse Recommendation",
+      "eta_mae": 0.836,
+      "eta_calibration": 0.485,
+      "overcrowding_events": 0,
+      "total_unmet_demand": 1508,
+      "missed_connections": 8,
+      "average_wait_minutes": 8.38,
+      "fleet_utilisation": 0.597,
+      "constraint_violations": 0
+    }
+  ]
+}

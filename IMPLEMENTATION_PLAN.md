@@ -188,4 +188,4 @@ Improvement reported as absolute delta and % change, with 95% CI over multiple s
 
 ---
 
-*Last updated: Phase 1 start*
+*Last updated: All phases 1–4 complete. 18/18 tests passing. Evaluation runs in <5s.*

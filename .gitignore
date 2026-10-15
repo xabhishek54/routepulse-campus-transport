@@ -59,6 +59,5 @@ logs/
 *.log
 
 # Markdown policy - allow important docs
-*.md
-!README.md
-!IMPLEMENTATION_PLAN.md
+# Allow all markdown docs at root level
+!*.md

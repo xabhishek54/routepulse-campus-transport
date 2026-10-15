@@ -5,8 +5,8 @@ Generates a realistic fictional campus ("Westbrook University") with:
   - 8 stops
   - 3 routes
   - Demand model driven by class changeovers, lunch, and evening exodus
-  - 2 vehicle types (small 25-pax, large 40-pax)
-  - Fixed schedules 08:00–20:00, every 15 min per route
+  - 2 vehicle types (small/large)
+  - Fixed schedules per operating window, every HEADWAY min per route
 
 All randomness is seeded for full reproducibility.
 """
@@ -18,34 +18,30 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 
+from routepulse.config import (
+    SEED, OP_START, OP_END, HEADWAY,
+    SMALL_BUS_CAPACITY, LARGE_BUS_CAPACITY, CAMPUS_BUS_SPEED_KMH,
+    DWELL_TIME_MINUTES, BASE_OFF_PEAK_MULT, PEAK_SIGMA_HOURS,
+    SMARTER_BASELINE_THRESHOLD,
+)
 from routepulse.models import (
     Stop, VehicleType, Vehicle, RouteStop, Route,
     ScheduledDeparture, Plan,
 )
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-SEED = 42
 RNG = np.random.default_rng(SEED)
 
-# Operating window: 08:00 – 20:00 in minutes-since-midnight
-OP_START = 8 * 60    # 480
-OP_END   = 20 * 60   # 1200
-HEADWAY  = 15        # minutes between departures on same route
-
 # ---------------------------------------------------------------------------
-# Vehicle types
+# Vehicle types — defined from config, not hardcoded here
 # ---------------------------------------------------------------------------
 VEHICLE_TYPES = {
-    "small": VehicleType("small", "Minibus (25)", 25),
-    "large": VehicleType("large", "Bus (40)",     40),
+    "small": VehicleType("small", f"Minibus ({SMALL_BUS_CAPACITY})", SMALL_BUS_CAPACITY),
+    "large": VehicleType("large", f"Bus ({LARGE_BUS_CAPACITY})", LARGE_BUS_CAPACITY),
 }
 
 
 # ---------------------------------------------------------------------------
 # Campus stops — Westbrook University
-#   Rough coordinates around a fictional UK campus (~1 km spread)
 # ---------------------------------------------------------------------------
 def make_stops() -> Dict[str, Stop]:
     raw = [
@@ -69,12 +65,6 @@ def make_stops() -> Dict[str, Stop]:
 # Routes
 # ---------------------------------------------------------------------------
 def _make_route_stops(stops: Dict[str, Stop], ordered_ids: List[str]) -> List[RouteStop]:
-    """Build RouteStop list with segment and cumulative travel times.
-
-    Travel time between consecutive stops is estimated from Haversine distance
-    at a nominal campus bus speed of 15 km/h.
-    """
-    SPEED_KMH = 15.0
     route_stops = []
     cumulative = 0.0
     prev_stop = None
@@ -84,8 +74,7 @@ def _make_route_stops(stops: Dict[str, Stop], ordered_ids: List[str]) -> List[Ro
             seg_time = 0.0
         else:
             dist = prev_stop.distance_km(s)
-            # add 0.5 min dwell at each intermediate stop
-            seg_time = (dist / SPEED_KMH) * 60 + 0.5
+            seg_time = (dist / CAMPUS_BUS_SPEED_KMH) * 60 + DWELL_TIME_MINUTES
         cumulative += seg_time
         route_stops.append(RouteStop(s, seg_time, round(cumulative, 2)))
         prev_stop = s
@@ -110,7 +99,6 @@ def make_routes(stops: Dict[str, Stop]) -> Dict[str, Route]:
 # ---------------------------------------------------------------------------
 def make_vehicles() -> Dict[str, Vehicle]:
     vehicles = {}
-    # 4 small, 3 large
     for i in range(1, 5):
         vid = f"V{i:02d}"
         vehicles[vid] = Vehicle(vid, VEHICLE_TYPES["small"])
@@ -128,19 +116,14 @@ def make_schedule(
     vehicles: Dict[str, Vehicle],
     vehicle_assignment: Dict[str, str] | None = None,
 ) -> List[ScheduledDeparture]:
-    """Generate departures every HEADWAY minutes for each route within operating hours.
-
-    vehicle_assignment: maps route_id -> vehicle_id override.
-    Default: R1 -> large bus, R2 -> small, R3 -> small.
-    """
+    """Generate departures every HEADWAY minutes for each route within operating hours."""
     default_assignment = {
         "R1": "V05",  # large — busiest loop
         "R2": "V01",  # small
         "R3": "V02",  # small
     }
     assignment = vehicle_assignment or default_assignment
-
-    vehicle_map = {vid: v for vid, v in vehicles.items()}
+    vehicle_map = dict(vehicles)
     departures = []
     dep_counter = 0
 
@@ -160,19 +143,28 @@ def make_schedule(
 # ---------------------------------------------------------------------------
 # Demand model
 # ---------------------------------------------------------------------------
+
+# Class-changeover peaks and their intensities — defined here as named data
+DEMAND_PEAKS = [
+    # (hour, strength) — strength is peak demand multiplier above base
+    (9.0,  2.0),   # 09:00 morning rush
+    (10.0, 1.5),   # 10:00 changeover
+    (11.0, 1.5),   # 11:00 changeover
+    (12.0, 2.5),   # 12:00 lunch
+    (13.0, 2.0),   # 13:00 lunch/changeover
+    (14.0, 1.5),   # 14:00 afternoon
+    (15.0, 1.5),   # 15:00 changeover
+    (16.0, 1.8),   # 16:00 late afternoon
+    (17.0, 3.0),   # 17:00 evening exodus
+]
+
+
 def demand_multiplier(time_min: float) -> float:
     """Return a demand scaling factor (>1 = high demand) for a given time of day."""
-    h = time_min / 60.0  # hours since midnight
-
-    # Gaussian peaks for class changeovers at 9, 10, 11, 12, 13, 14, 15, 16, 17
-    peaks = [9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0]
-    strengths = [2.0, 1.5, 1.5, 2.5, 2.0, 1.5, 1.5, 1.8, 3.0]  # 17:00 = evening exodus
-    sigma = 0.25  # 15-min wide peaks
-
-    mult = 0.3  # base off-peak
-    for peak, strength in zip(peaks, strengths):
-        mult += strength * math.exp(-0.5 * ((h - peak) / sigma) ** 2)
-
+    h = time_min / 60.0
+    mult = BASE_OFF_PEAK_MULT
+    for peak_h, strength in DEMAND_PEAKS:
+        mult += strength * math.exp(-0.5 * ((h - peak_h) / PEAK_SIGMA_HOURS) ** 2)
     return max(0.1, mult)
 
 
@@ -270,26 +262,29 @@ def build_baseline_plan(
 
 
 def build_smarter_baseline_plan(stops=None, routes=None, vehicles=None) -> Plan:
-    """Smarter baseline: swap to large bus on routes predicted to exceed 80% load at peak."""
+    """
+    Smarter baseline: swap to large bus on routes predicted to exceed
+    SMARTER_BASELINE_THRESHOLD load at peak time (09:00).
+    """
     if routes is None or vehicles is None:
         stops, routes, vehicles, _ = build_campus()
 
-    # Predict peak load: use demand_multiplier at 09:00 (480+60=540 min)
-    peak_time = 540.0
+    peak_time = 9.0 * 60  # 09:00 in minutes
     peak_assignment = {}
-    large_bus_ids = [vid for vid, v in vehicles.items() if v.capacity == 40]
-    small_bus_ids = [vid for vid, v in vehicles.items() if v.capacity == 25]
+    large_bus_ids = [vid for vid, v in vehicles.items()
+                     if v.vehicle_type.type_id == "large"]
+    small_bus_ids = [vid for vid, v in vehicles.items()
+                     if v.vehicle_type.type_id == "small"]
     large_idx = 0
     small_idx = 0
 
     for rid, route in routes.items():
-        # estimate peak load as sum of demand across stops at 09:00
         rng_tmp = np.random.default_rng(SEED)
         est_load = sum(
             passenger_demand(rs.stop, peak_time, rng_tmp) for rs in route.route_stops
         )
-        capacity_small = 25
-        if est_load / capacity_small > 0.80:
+        small_cap = VEHICLE_TYPES["small"].capacity
+        if est_load / small_cap > SMARTER_BASELINE_THRESHOLD:
             peak_assignment[rid] = large_bus_ids[large_idx % len(large_bus_ids)]
             large_idx += 1
         else:
@@ -300,7 +295,10 @@ def build_smarter_baseline_plan(stops=None, routes=None, vehicles=None) -> Plan:
     return Plan(
         plan_id="baseline_smarter",
         name="Smarter Baseline",
-        description="Swaps to large bus on routes predicted to exceed 80% peak load. No other changes.",
+        description=(
+            f"Swaps to large bus on routes predicted to exceed "
+            f"{SMARTER_BASELINE_THRESHOLD:.0%} peak load. No other changes."
+        ),
         departures=departures,
         actions_applied=[],
     )

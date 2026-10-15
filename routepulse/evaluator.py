@@ -10,6 +10,7 @@ from typing import List, Dict
 
 import numpy as np
 
+from routepulse.config import AVG_WAIT_BASE
 from routepulse.models import Plan, SimulatedTrip, EvaluationResult
 from routepulse.estimator import evaluate_eta_over_trips
 from routepulse.detector import detect_all
@@ -41,7 +42,7 @@ def compute_metrics(
     # (proper passenger waiting model would require individual passenger records)
     all_delays = [ev.delay for t in trips for ev in t.stop_events]
     mean_delay = sum(max(0, d) for d in all_delays) / len(all_delays) if all_delays else 0.0
-    avg_wait = 7.5 + mean_delay   # half-headway base + delay
+    avg_wait = AVG_WAIT_BASE + mean_delay   # half-headway base + propagated delay
 
     # Fleet utilisation
     load_fracs = [

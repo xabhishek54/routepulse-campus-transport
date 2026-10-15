@@ -3,7 +3,7 @@ Discrete-event bus simulator for RoutePulse.
 
 For each ScheduledDeparture in a Plan, this simulator:
   1. Advances stop by stop
-  2. Draws travel-time noise (Gaussian around nominal)
+  2. Draws travel-time noise (Gaussian around nominal) — sigma from config
   3. Samples passenger demand at each stop (Poisson, scaled by time-of-day)
   4. Applies optional disruption effects
   5. Records a StopEvent at each stop
@@ -12,15 +12,17 @@ For each ScheduledDeparture in a Plan, this simulator:
 All randomness is seeded per-trip for reproducibility.
 """
 from __future__ import annotations
-import math
 from typing import List, Optional, Dict
 
 import numpy as np
 
+from routepulse.config import (
+    SEED, TRAVEL_NOISE_SIGMA, ALIGHTING_FRACTION,
+)
 from routepulse.models import (
     ScheduledDeparture, SimulatedTrip, StopEvent, Plan,
 )
-from routepulse.data_gen import passenger_demand, SEED
+from routepulse.data_gen import passenger_demand
 
 
 # ---------------------------------------------------------------------------
@@ -29,15 +31,12 @@ from routepulse.data_gen import passenger_demand, SEED
 class Disruption:
     """Base class for disruption effects applied during simulation."""
     def travel_delay(self, departure_id: str, segment_idx: int, rng: np.random.Generator) -> float:
-        """Extra travel time (minutes) added to a segment. Override in subclasses."""
         return 0.0
 
     def demand_multiplier(self, stop_id: str, time_min: float) -> float:
-        """Demand scaling factor. Override in subclasses."""
         return 1.0
 
     def vehicle_available(self, departure_id: str) -> bool:
-        """Return False to mark vehicle as broken down (trip cancelled)."""
         return True
 
 
@@ -83,23 +82,21 @@ def simulate_trip(
     departure: ScheduledDeparture,
     base_seed: int = SEED,
     disruptions: Optional[List[Disruption]] = None,
-    travel_time_noise_sigma: float = 0.8,   # minutes std dev per segment
-    alighting_fraction: float = 0.35,        # fraction of on-board who alight at each stop
+    travel_time_noise_sigma: float = TRAVEL_NOISE_SIGMA,
+    alighting_fraction: float = ALIGHTING_FRACTION,
 ) -> Optional[SimulatedTrip]:
     """
     Simulate a single trip. Returns None if vehicle is unavailable (breakdown).
 
-    travel_time_noise_sigma: std dev of Gaussian noise added to each segment's travel time.
-    alighting_fraction: fraction of currently on-board passengers who alight at each stop.
+    travel_time_noise_sigma: std dev of Gaussian noise added to each segment (minutes).
+    alighting_fraction: fraction of on-board passengers who alight at each stop.
     """
     disruptions = disruptions or []
 
-    # Check availability
     for d in disruptions:
         if not d.vehicle_available(departure.departure_id):
             return None
 
-    # Unique seed per trip for reproducibility
     trip_seed = hash((base_seed, departure.departure_id)) % (2**31)
     rng = np.random.default_rng(trip_seed)
 
@@ -114,29 +111,23 @@ def simulate_trip(
         stop = route_stop.stop
         scheduled_arr = departure.scheduled_arrival_at(stop.stop_id)
 
-        # Travel time for this segment
         if seg_idx > 0:
             seg_nominal = route_stop.segment_travel_time
             noise = rng.normal(0, travel_time_noise_sigma)
-            # disruption-added delay
             extra = sum(d.travel_delay(departure.departure_id, seg_idx, rng) for d in disruptions)
             seg_actual = max(0.5, seg_nominal + noise + extra)
             current_time += seg_actual
 
-        # Demand at this stop
         dis_mult = 1.0
         for d in disruptions:
             dis_mult *= d.demand_multiplier(stop.stop_id, current_time)
         demand = passenger_demand(stop, current_time, rng, dis_mult)
 
-        # Alighting — fraction of on-board leave (except at first stop)
         alighted = 0
         if seg_idx > 0:
             alighted = int(round(on_board * alighting_fraction))
-            on_board -= alighted
-            on_board = max(0, on_board)
+            on_board = max(0, on_board - alighted)
 
-        # Boarding — limited by remaining capacity
         space = capacity - on_board
         boarded = min(demand, space)
         on_board += boarded

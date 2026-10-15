@@ -31,11 +31,13 @@ from routepulse.validator import validate
 # ---------------------------------------------------------------------------
 # Thresholds
 # ---------------------------------------------------------------------------
-OVERCROWD_THRESHOLD = 0.85       # flag if mean load/capacity > this
-UNMET_DEMAND_THRESHOLD = 3       # flag if total unmet demand per trip > this
+OVERCROWD_THRESHOLD = 0.92       # flag if mean load/capacity > this
+UNMET_DEMAND_THRESHOLD = 8       # flag if total unmet demand per trip > this
 NUDGE_MINUTES = 5.0              # departure shift for connection fixing
 LARGE_BUS = VehicleType("large", "Bus (40)", 40)
 SMALL_BUS = VehicleType("small", "Minibus (25)", 25)
+MAX_SWAPS = 10                   # cap recommendations to avoid over-engineering
+MAX_EXTRA_TRIPS = 5              # cap extra trips inserted
 
 
 # ---------------------------------------------------------------------------
@@ -78,9 +80,11 @@ def recommend_vehicle_swaps(
     for trip in trips:
         dep = trip.departure
         lf = _mean_load_fraction(trip)
+        if len(actions) >= MAX_SWAPS:
+            break
         if lf > OVERCROWD_THRESHOLD or trip.total_unmet_demand > UNMET_DEMAND_THRESHOLD:
             if dep.vehicle.capacity < LARGE_BUS.capacity:
-                new_vid = _next_available_vehicle_id(existing_vids | set(swaps.values()), LARGE_BUS)
+                new_vid = _next_available_vehicle_id(existing_vids | {v.vehicle_id for v in swaps.values()}, LARGE_BUS)
                 new_vehicle = Vehicle(new_vid, LARGE_BUS)
                 swaps[dep.departure_id] = new_vehicle
                 existing_vids.add(new_vid)
@@ -127,6 +131,8 @@ def recommend_extra_trips(
     counter = [len(plan.departures)]
 
     for trip in trips:
+        if len(extra_departures) >= MAX_EXTRA_TRIPS:
+            break
         dep = trip.departure
         # Check if swap resolves it; if still high unmet demand, add extra trip
         if dep.departure_id in vehicle_swaps:
